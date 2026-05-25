@@ -1,4 +1,6 @@
-import asyncio, logging, os
+import asyncio
+import logging
+import os
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
@@ -10,26 +12,27 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 
+# ─── КОНФИГУРАЦИЯ ───────────────────────────────────────────────────────────
 TOKEN        = os.getenv("BOT_TOKEN", "8895842204:AAGg3NVgJkCg7I6OVD_-Nkr7DfD4VxZw1jQ")
 WEBHOOK_HOST = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL  = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else ""
 WEB_URL      = f"https://{WEBHOOK_HOST}" if WEBHOOK_HOST else "http://localhost:8000"
-MAX_MSG      = 4096
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp  = Dispatcher()
+
+# Внутреннее хранилище профилей (в продакшене лучше использовать БД)
 profiles: dict[int, dict] = {}
 
-
+# ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ──────────────────────────────────────────────────
 def fmt_date(ts) -> str:
     if not ts:
         return "неизвестно"
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-
 
 def parse_gifts(gifts_raw) -> list[dict]:
     result = []
@@ -46,7 +49,7 @@ def parse_gifts(gifts_raw) -> list[dict]:
         })
     return result
 
-
+# ─── ОБРАБОТЧИК AIOGRAM ──────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user    = message.from_user
@@ -56,31 +59,35 @@ async def cmd_start(message: types.Message):
     try:
         full_info = await bot.get_chat(chat_id)
     except Exception as e:
-        log.warning(f"getChat: {e}")
+        log.warning(f"getChat error: {e}")
 
     gifts_raw = None
     try:
         resp = await bot.get_user_gifts(user_id=chat_id)
         gifts_raw = resp.gifts if resp and resp.gifts else None
     except Exception as e:
-        log.warning(f"getUserGifts: {e}")
+        log.warning(f"getUserGifts error: {e}")
 
     photos = None
     try:
         photos = await bot.get_user_profile_photos(chat_id, limit=1)
     except Exception as e:
-        log.warning(f"getPhotos: {e}")
+        log.warning(f"getPhotos error: {e}")
 
     avatar_url = None
     if photos and photos.total_count > 0:
-        file_id   = photos.photos[0][-1].file_id
-        file_info = await bot.get_file(file_id)
-        avatar_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}"
+        try:
+            file_id   = photos.photos[0][-1].file_id
+            file_info = await bot.get_file(file_id)
+            avatar_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}"
+        except Exception as e:
+            log.warning(f"getFile error: {e}")
 
     name_parts = [user.first_name]
     if user.last_name:
         name_parts.append(user.last_name)
 
+    # Сохраняем информацию о пользователе
     profile = {
         "id":         user.id,
         "full_name":  " ".join(name_parts),
@@ -98,7 +105,7 @@ async def cmd_start(message: types.Message):
     }
     profiles[chat_id] = profile
 
-    # Mini Web App кнопка — открывает сразу на профиль пользователя
+    # Ссылки на Web App
     webapp_url = f"{WEB_URL}/app?uid={chat_id}"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -107,41 +114,18 @@ async def cmd_start(message: types.Message):
         )
     ]])
 
+    # Сразу отправляем только одно красивое приветственное сообщение
     await message.answer(
-        f"👋 Привет, <b>{profile['full_name']}</b>!\nТвой профиль готов:",
+        f"👋 Привет, <b>{profile['full_name']}</b>!\n\nТвой профиль успешно сгенерирован. Нажми на кнопку ниже, чтобы открыть его в стильном Web App.",
         reply_markup=kb
     )
 
-    # Подарки в чат (разбивка)
-    gift_lines = []
-    for g in profile["gifts"]:
-        gift_lines.append(
-            f"┌ 🎀 <b>{g['id']}</b>\n"
-            f"├ Цена: {g['stars']} ⭐\n"
-            f"├ Подпись: {g['text']}\n"
-            f"├ От: <code>{g['sender_id']}</code> ({g['sender']})\n"
-            f"├ Дата: {g['date']}\n"
-            f"└ Приватный: {'🔒 да' if g['private'] else 'нет'}"
-        )
-    if gift_lines:
-        chunk = "🎁 <b>Gifts:</b>\n\n"
-        for line in gift_lines:
-            candidate = chunk + line + "\n\n"
-            if len(candidate) > MAX_MSG:
-                await message.answer(chunk.strip())
-                chunk = line + "\n\n"
-            else:
-                chunk = candidate
-        if chunk.strip():
-            await message.answer(chunk.strip())
-
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
+# ─── FASTAPI LIFESPAN & WEBHOOKS ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
-        log.info(f"Webhook: {WEBHOOK_URL}")
+        log.info(f"Webhook set to: {WEBHOOK_URL}")
     else:
         asyncio.create_task(dp.start_polling(bot))
         log.info("Polling started")
@@ -150,7 +134,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data   = await request.json()
@@ -158,11 +141,10 @@ async def telegram_webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-
+# ─── API ENDPOINTS ───────────────────────────────────────────────────────────
 @app.get("/api/profiles")
 async def api_profiles():
     return JSONResponse(list(profiles.values()))
-
 
 @app.get("/api/profile/{user_id}")
 async def api_profile(user_id: int):
@@ -171,515 +153,556 @@ async def api_profile(user_id: int):
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse(p)
 
-
 @app.get("/app", response_class=HTMLResponse)
 async def mini_app(uid: int = 0):
     return HTMLResponse(get_app_html(uid))
-
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(get_app_html(0))
 
-
+# ─── FRONTEND (MATERIAL YOU) ─────────────────────────────────────────────────
 def get_app_html(initial_uid: int) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>InfoAboutYou</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Google+Sans+Display:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
+/* Material You Монохромная палитра с динамической адаптацией под тему */
 :root {{
-  --md-sys-color-primary: #6750A4;
-  --md-sys-color-on-primary: #FFFFFF;
-  --md-sys-color-primary-container: #EADDFF;
-  --md-sys-color-on-primary-container: #21005D;
-  --md-sys-color-secondary: #625B71;
-  --md-sys-color-secondary-container: #E8DEF8;
-  --md-sys-color-surface: #FFFBFE;
-  --md-sys-color-surface-variant: #E7E0EC;
-  --md-sys-color-on-surface: #1C1B1F;
-  --md-sys-color-on-surface-variant: #49454F;
-  --md-sys-color-outline: #79747E;
-  --md-sys-color-outline-variant: #CAC4D0;
-  --md-sys-color-background: #FFFBFE;
-  --md-sys-color-error: #B3261E;
-  --md-sys-color-success: #386A20;
-  --md-elevation-1: 0 1px 2px rgba(0,0,0,.08),0 2px 6px rgba(0,0,0,.06);
-  --md-elevation-2: 0 1px 2px rgba(0,0,0,.1),0 4px 8px rgba(0,0,0,.08);
-  --md-elevation-3: 0 4px 8px rgba(0,0,0,.1),0 8px 16px rgba(0,0,0,.08);
-  --radius-xs: 8px; --radius-s: 12px; --radius-m: 16px; --radius-l: 24px; --radius-xl: 28px;
-  --font: 'Google Sans', sans-serif;
+  --md-co-surface: #F9F9FC;
+  --md-co-on-surface: #1A1C1E;
+  --md-co-surface-variant: #E0E2EC;
+  --md-co-on-surface-variant: #43474E;
+  --md-co-primary: #0061A4;
+  --md-co-on-primary: #FFFFFF;
+  --md-co-primary-container: #D1E4FF;
+  --md-co-on-primary-container: #001D36;
+  --md-co-secondary-container: #E1E2EC;
+  --md-co-on-secondary-container: #161C24;
+  --md-co-outline: #73777F;
+  --md-co-outline-variant: #C4C6D0;
+  --md-co-error: #BA1A1A;
+  --md-co-success: #2E6C00;
+  
+  --font: 'Roboto', sans-serif;
+  --duration: 0.25s;
+  --easing: cubic-bezier(0.2, 0, 0, 1);
 }}
-@media(prefers-color-scheme:dark) {{
+
+@media(prefers-color-scheme: dark) {{
   :root {{
-    --md-sys-color-primary: #D0BCFF;
-    --md-sys-color-on-primary: #381E72;
-    --md-sys-color-primary-container: #4F378B;
-    --md-sys-color-on-primary-container: #EADDFF;
-    --md-sys-color-secondary: #CCC2DC;
-    --md-sys-color-secondary-container: #4A4458;
-    --md-sys-color-surface: #1C1B1F;
-    --md-sys-color-surface-variant: #49454F;
-    --md-sys-color-on-surface: #E6E1E5;
-    --md-sys-color-on-surface-variant: #CAC4D0;
-    --md-sys-color-outline: #938F99;
-    --md-sys-color-outline-variant: #49454F;
-    --md-sys-color-background: #1C1B1F;
-    --md-sys-color-error: #F2B8B5;
-    --md-sys-color-success: #A8D5A2;
+    --md-co-surface: #111318;
+    --md-co-on-surface: #E2E2E6;
+    --md-co-surface-variant: #43474E;
+    --md-co-on-surface-variant: #C4C6D0;
+    --md-co-primary: #9ECAFF;
+    --md-co-on-primary: #003258;
+    --md-co-primary-container: #00497D;
+    --md-co-on-primary-container: #D1E4FF;
+    --md-co-secondary-container: #33353A;
+    --md-co-on-secondary-container: #E2E2E6;
+    --md-co-outline: #8C9199;
+    --md-co-outline-variant: #43474E;
+    --md-co-error: #FFB4AB;
+    --md-co-success: #76DE35;
   }}
 }}
+
 * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }}
+
 body {{
   font-family: var(--font);
-  background: var(--md-sys-color-background);
-  color: var(--md-sys-color-on-surface);
+  background: var(--md-co-surface);
+  color: var(--md-co-on-surface);
   min-height: 100dvh;
   overflow-x: hidden;
+  padding-bottom: calc(80px + env(safe-area-inset-bottom));
 }}
 
-/* Navigation Bar */
-.nav-bar {{
-  position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
-  background: var(--md-sys-color-surface);
-  border-top: 1px solid var(--md-sys-color-outline-variant);
-  display: flex;
-  padding: 0 0 env(safe-area-inset-bottom);
-  box-shadow: 0 -1px 3px rgba(0,0,0,.06);
-}}
-.nav-item {{
-  flex: 1; display: flex; flex-direction: column; align-items: center;
-  padding: 12px 0 10px; gap: 4px; cursor: pointer; border: none;
-  background: transparent; color: var(--md-sys-color-on-surface-variant);
-  font-family: var(--font); font-size: 12px; transition: color .2s;
-  position: relative;
-}}
-.nav-item.active {{ color: var(--md-sys-color-primary); }}
-.nav-indicator {{
-  position: absolute; top: 6px; width: 64px; height: 32px;
-  background: var(--md-sys-color-secondary-container);
-  border-radius: 16px; opacity: 0; transform: scaleX(.6);
-  transition: opacity .2s, transform .2s;
-}}
-.nav-item.active .nav-indicator {{ opacity: 1; transform: scaleX(1); }}
-.nav-icon {{ font-size: 22px; position: relative; z-index: 1; }}
-.nav-label {{ position: relative; z-index: 1; font-weight: 500; }}
-
-/* Screens */
-.screen {{ display: none; flex-direction: column; min-height: 100dvh; padding-bottom: 80px; }}
-.screen.active {{ display: flex; }}
-
-/* Top App Bar */
+/* Фиксированный Top App Bar */
 .top-bar {{
   position: sticky; top: 0; z-index: 50;
-  background: var(--md-sys-color-surface);
-  padding: 16px 16px 8px;
-  display: flex; align-items: center; gap: 12px;
+  background: var(--md-co-surface);
+  padding: calc(16px + env(safe-area-inset-top)) 16px 12px;
+  display: flex; align-items: center; gap: 16px;
+  border-bottom: 1px solid transparent;
+  transition: border-color var(--duration) var(--easing), background var(--duration);
 }}
-.top-bar h1 {{
-  font-family: 'Google Sans Display', sans-serif;
-  font-size: 22px; font-weight: 400;
-  color: var(--md-sys-color-on-surface); flex: 1;
+.top-bar.scrolled {{
+  border-color: var(--md-co-outline-variant);
+  background: var(--md-co-surface);
 }}
+.top-bar .back-btn {{
+  background: transparent; border: none; font-size: 22px; cursor: pointer;
+  color: var(--md-co-on-surface); display: none; align-items: center; justify-content: center;
+  width: 40px; height: 40px; border-radius: 50%;
+}}
+.top-bar .back-btn:active {{ background: var(--md-co-secondary-container); }}
+.top-bar h1 {{ font-size: 22px; font-weight: 400; flex: 1; }}
+.top-bar .refresh-btn {{
+  width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; cursor: pointer; font-size: 20px;
+}}
+.top-bar .refresh-btn:active {{ background: var(--md-co-secondary-container); }}
 
-/* Search bar */
+/* Контейнеры экранов */
+.screen {{ display: none; animation: fadeIn var(--duration) var(--easing) both; }}
+.screen.active {{ display: block; }}
+@keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+
+/* Поиск M3 */
+.search-container {{ padding: 8px 16px 16px; }}
 .search-bar {{
-  margin: 8px 16px 16px;
   display: flex; align-items: center; gap: 12px;
-  background: var(--md-sys-color-surface-variant);
-  border-radius: 28px; padding: 10px 20px;
-  box-shadow: var(--md-elevation-1);
+  background: var(--md-co-secondary-container);
+  border-radius: 28px; padding: 0 16px; height: 56px;
 }}
 .search-bar input {{
-  flex: 1; border: none; background: transparent;
-  font-family: var(--font); font-size: 16px;
-  color: var(--md-sys-color-on-surface); outline: none;
+  flex: 1; border: none; background: transparent; font-family: var(--font);
+  font-size: 16px; color: var(--md-co-on-secondary-container); outline: none;
 }}
-.search-bar input::placeholder {{ color: var(--md-sys-color-on-surface-variant); }}
-.search-icon {{ font-size: 20px; color: var(--md-sys-color-on-surface-variant); }}
+.search-bar input::placeholder {{ color: var(--md-co-on-surface-variant); }}
+.search-bar .icon {{ color: var(--md-co-on-surface-variant); font-size: 20px; }}
 
-/* Profile Hero */
+/* Герой Профиля (Material Design Banner) */
 .profile-hero {{
-  margin: 0 16px 16px;
-  background: linear-gradient(135deg, var(--md-sys-color-primary-container), var(--md-sys-color-secondary-container));
-  border-radius: var(--radius-xl);
-  padding: 28px 24px;
+  margin: 8px 16px 16px;
+  background: var(--md-co-primary-container);
+  color: var(--md-co-on-primary-container);
+  border-radius: 28px; padding: 24px;
   display: flex; align-items: center; gap: 20px;
-  box-shadow: var(--md-elevation-2);
-  animation: slideUp .4s ease;
 }}
-@keyframes slideUp {{ from {{ opacity:0; transform:translateY(20px) }} to {{ opacity:1; transform:translateY(0) }} }}
-.avatar-wrap {{ position: relative; flex-shrink: 0; }}
+.avatar-container {{ position: relative; flex-shrink: 0; }}
 .avatar {{
-  width: 80px; height: 80px; border-radius: 50%; object-fit: cover;
-  border: 3px solid var(--md-sys-color-primary);
-  background: var(--md-sys-color-surface-variant);
+  width: 84px; height: 84px; border-radius: 50%; object-fit: cover;
+  background: var(--md-co-surface-variant); display: block;
 }}
 .avatar-placeholder {{
-  width: 80px; height: 80px; border-radius: 50%;
-  background: var(--md-sys-color-primary);
+  width: 84px; height: 84px; border-radius: 50%;
+  background: var(--md-co-primary); color: var(--md-co-on-primary);
   display: flex; align-items: center; justify-content: center;
-  font-size: 32px; color: var(--md-sys-color-on-primary); font-weight: 700;
+  font-size: 32px; font-weight: 500;
 }}
-.premium-badge {{
-  position: absolute; bottom: -2px; right: -2px;
-  background: #FFB800; border-radius: 50%; width: 24px; height: 24px;
-  display: flex; align-items: center; justify-content: center; font-size: 13px;
-  border: 2px solid var(--md-sys-color-surface);
+.premium-dot {{
+  position: absolute; bottom: 0; right: 0; background: #FFB800;
+  width: 24px; height: 24px; border-radius: 50%; border: 3px solid var(--md-co-primary-container);
+  display: flex; align-items: center; justify-content: center; font-size: 11px;
 }}
-.hero-info {{ flex: 1; min-width: 0; }}
-.hero-name {{
-  font-size: 20px; font-weight: 700;
-  color: var(--md-sys-color-on-primary-container);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}}
-.hero-username {{
-  font-size: 14px; color: var(--md-sys-color-primary);
-  margin-top: 2px; font-weight: 500;
-}}
-.hero-id {{
-  font-size: 12px; color: var(--md-sys-color-on-surface-variant);
-  margin-top: 6px; font-family: monospace;
-}}
+.hero-details {{ flex: 1; min-width: 0; }}
+.hero-title {{ font-size: 22px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.hero-subtitle {{ font-size: 14px; opacity: 0.8; margin-top: 2px; font-weight: 500; }}
+.hero-id {{ font-size: 12px; opacity: 0.6; margin-top: 6px; font-family: monospace; }}
 
-/* Info Cards Grid */
-.cards-grid {{
-  display: grid; grid-template-columns: 1fr 1fr;
-  gap: 12px; margin: 0 16px 16px;
+/* Сетка карточек */
+.info-grid {{
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin: 0 16px 24px;
 }}
 .info-card {{
-  background: var(--md-sys-color-surface);
-  border-radius: var(--radius-m);
-  padding: 16px; box-shadow: var(--md-elevation-1);
-  animation: slideUp .4s ease both;
+  background: var(--md-co-secondary-container);
+  color: var(--md-co-on-secondary-container);
+  border-radius: 16px; padding: 16px;
+  display: flex; flex-direction: column; gap: 4px;
 }}
-.info-card .label {{
-  font-size: 11px; font-weight: 600; letter-spacing: .06em;
-  text-transform: uppercase; color: var(--md-sys-color-on-surface-variant);
-  margin-bottom: 6px;
-}}
-.info-card .value {{
-  font-size: 15px; font-weight: 600; color: var(--md-sys-color-on-surface);
-}}
-.value.yes {{ color: var(--md-sys-color-success); }}
-.value.no  {{ color: var(--md-sys-color-error); }}
-.value.warn {{ color: #E65100; }}
+.info-card .label {{ font-size: 12px; font-weight: 500; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.5px; }}
+.info-card .value {{ font-size: 16px; font-weight: 700; }}
+.value.success {{ color: var(--md-co-success); }}
+.value.error {{ color: var(--md-co-error); }}
 
-/* Section title */
+/* Заголовки секций */
 .section-title {{
-  font-size: 14px; font-weight: 600; letter-spacing: .04em;
-  color: var(--md-sys-color-on-surface-variant);
-  text-transform: uppercase;
-  margin: 0 16px 10px; margin-top: 8px;
+  font-size: 14px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--md-co-on-surface-variant);
+  margin: 0 24px 12px;
 }}
 
-/* Gift Cards */
+/* Карточки Подарков */
 .gift-card {{
-  margin: 0 16px 12px;
-  background: var(--md-sys-color-surface);
-  border-radius: var(--radius-l);
-  box-shadow: var(--md-elevation-1);
-  overflow: hidden;
-  animation: slideUp .4s ease both;
+  background: var(--md-co-surface);
+  border: 1px solid var(--md-co-outline-variant);
+  border-radius: 20px; margin: 0 16px 12px; overflow: hidden;
 }}
 .gift-header {{
-  background: var(--md-sys-color-primary-container);
-  padding: 12px 16px;
-  display: flex; align-items: center; gap: 10px;
+  background: var(--md-co-secondary-container); padding: 12px 16px;
+  display: flex; align-items: center; justify-content: space-between;
 }}
-.gift-header .gift-name {{
-  font-weight: 700; color: var(--md-sys-color-on-primary-container); font-size: 15px; flex: 1;
+.gift-title {{ font-weight: 700; font-size: 15px; }}
+.gift-badge {{
+  background: var(--md-co-primary); color: var(--md-co-on-primary);
+  padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 700;
 }}
-.gift-stars {{
-  background: var(--md-sys-color-primary);
-  color: var(--md-sys-color-on-primary);
-  border-radius: 20px; padding: 3px 10px;
-  font-size: 13px; font-weight: 700;
-}}
-.gift-body {{ padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }}
-.gift-row {{
-  display: flex; justify-content: space-between; align-items: center;
-  font-size: 13px;
-}}
-.gift-row .gr-label {{ color: var(--md-sys-color-on-surface-variant); }}
-.gift-row .gr-val {{ font-weight: 500; color: var(--md-sys-color-on-surface); text-align: right; max-width: 60%; }}
-.gift-private {{
-  background: var(--md-sys-color-secondary-container);
-  color: var(--md-sys-color-on-surface-variant);
-  font-size: 11px; padding: 2px 8px; border-radius: 10px;
-}}
+.gift-body {{ padding: 16px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }}
+.gift-row {{ display: flex; justify-content: space-between; gap: 8px; }}
+.gift-row .prop {{ color: var(--md-co-on-surface-variant); }}
+.gift-row .val {{ font-weight: 500; text-align: right; max-width: 70%; }}
 
-/* People list */
-.people-list {{ padding: 0 16px; display: flex; flex-direction: column; gap: 10px; }}
-.person-card {{
-  background: var(--md-sys-color-surface);
-  border-radius: var(--radius-m);
-  padding: 14px 16px;
-  display: flex; align-items: center; gap: 14px;
-  box-shadow: var(--md-elevation-1);
-  cursor: pointer; transition: box-shadow .2s;
-  animation: slideUp .3s ease both;
+/* Список людей */
+.people-list {{ display: flex; flex-direction: column; gap: 8px; padding: 0 16px; }}
+.person-item {{
+  display: flex; align-items: center; gap: 16px; padding: 12px 16px;
+  background: var(--md-co-surface); border: 1px solid var(--md-co-outline-variant);
+  border-radius: 16px; cursor: pointer; transition: background var(--duration);
 }}
-.person-card:active {{ box-shadow: var(--md-elevation-2); }}
-.person-avatar {{
-  width: 48px; height: 48px; border-radius: 50%; object-fit: cover;
-  background: var(--md-sys-color-primary);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 18px; font-weight: 700; color: var(--md-sys-color-on-primary);
-  flex-shrink: 0;
+.person-item:active {{ background: var(--md-co-secondary-container); }}
+.person-avatar {{ width: 48px; height: 48px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }}
+.person-avatar-placeholder {{
+  width: 48px; height: 48px; border-radius: 50%; background: var(--md-co-primary);
+  color: var(--md-co-on-primary); display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 700; flex-shrink: 0;
 }}
 .person-info {{ flex: 1; min-width: 0; }}
-.person-name {{ font-weight: 600; font-size: 15px; color: var(--md-sys-color-on-surface); }}
-.person-sub  {{ font-size: 12px; color: var(--md-sys-color-on-surface-variant); margin-top: 2px; }}
-.person-chip {{
-  background: var(--md-sys-color-primary-container);
-  color: var(--md-sys-color-on-primary-container);
-  border-radius: 12px; padding: 4px 10px; font-size: 11px; font-weight: 600;
+.person-name {{ font-weight: 700; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.person-sub {{ font-size: 13px; color: var(--md-co-on-surface-variant); margin-top: 2px; }}
+.person-badge {{
+  background: var(--md-co-primary-container); color: var(--md-co-on-primary-container);
+  padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 500;
 }}
 
-/* FAB */
-.fab {{
-  position: fixed; right: 20px; bottom: 88px;
-  width: 56px; height: 56px; border-radius: 16px;
-  background: var(--md-sys-color-primary-container);
-  color: var(--md-sys-color-on-primary-container);
-  border: none; font-size: 24px; cursor: pointer;
-  box-shadow: var(--md-elevation-3);
-  display: flex; align-items: center; justify-content: center;
-  transition: transform .2s;
+/* Нижняя навигация M3 Navigation Bar */
+.nav-bar {{
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+  background: var(--md-co-surface);
+  border-top: 1px solid var(--md-co-outline-variant);
+  display: flex; height: calc(64px + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
 }}
-.fab:active {{ transform: scale(.94); }}
+.nav-item {{
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: transparent; border: none; cursor: pointer; gap: 4px;
+  color: var(--md-co-on-surface-variant); font-family: var(--font); font-size: 12px; font-weight: 500;
+}}
+.nav-pill {{
+  width: 64px; height: 32px; border-radius: 16px; display: flex; align-items: center;
+  justify-content: center; transition: background var(--duration) var(--easing);
+  font-size: 20px; color: var(--md-co-on-surface-variant);
+}}
+.nav-item.active .nav-pill {{
+  background: var(--md-co-primary-container);
+  color: var(--md-co-on-primary-container);
+}}
+.nav-item.active {{ color: var(--md-co-on-surface); font-weight: 700; }}
 
-/* Empty state */
-.empty {{
-  text-align: center; padding: 60px 20px;
-  color: var(--md-sys-color-on-surface-variant);
-}}
-.empty-icon {{ font-size: 64px; margin-bottom: 16px; }}
-.empty-text {{ font-size: 16px; font-weight: 500; }}
-.empty-sub  {{ font-size: 14px; margin-top: 6px; opacity: .7; }}
-
-/* Loading */
-.loader {{
-  display: flex; justify-content: center; padding: 40px;
-}}
+/* Состояния */
+.empty-state {{ text-align: center; padding: 48px 24px; color: var(--md-co-on-surface-variant); }}
+.empty-icon {{ font-size: 48px; margin-bottom: 12px; }}
+.loader {{ display: flex; justify-content: center; padding: 48px; }}
 .spinner {{
-  width: 40px; height: 40px; border: 3px solid var(--md-sys-color-outline-variant);
-  border-top-color: var(--md-sys-color-primary);
-  border-radius: 50%; animation: spin .8s linear infinite;
+  width: 36px; height: 36px; border: 4px solid var(--md-co-outline-variant);
+  border-top-color: var(--md-co-primary); border-radius: 50%;
+  animation: spin 0.8s linear infinite;
 }}
-@keyframes spin {{ to {{ transform: rotate(360deg) }} }}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 </style>
 </head>
 <body>
 
-<!-- Screen: My Profile -->
-<div class="screen active" id="screen-me">
-  <div class="top-bar">
-    <h1>Мой профиль</h1>
-    <span id="refresh-btn" style="font-size:22px;cursor:pointer" onclick="loadMe()">🔄</span>
-  </div>
-  <div id="me-content"><div class="loader"><div class="spinner"></div></div></div>
+<div class="top-bar" id="main-top-bar">
+  <button class="back-btn" id="back-button" onclick="goBack()">←</button>
+  <h1 id="top-bar-title">Мой профиль</h1>
+  <div class="refresh-btn" id="refresh-button" onclick="handleRefresh()">🔄</div>
 </div>
 
-<!-- Screen: Search -->
+<div class="screen active" id="screen-profile">
+  <div id="profile-content">
+    <div class="loader"><div class="spinner"></div></div>
+  </div>
+</div>
+
 <div class="screen" id="screen-search">
-  <div class="top-bar"><h1>Поиск</h1></div>
-  <div class="search-bar">
-    <span class="search-icon">🔍</span>
-    <input type="text" id="search-input" placeholder="Имя или @username…" oninput="filterPeople()">
+  <div class="search-container">
+    <div class="search-bar">
+      <span class="icon">🔍</span>
+      <input type="text" id="search-input" placeholder="Поиск по имени или @username..." oninput="onSearchInput()">
+    </div>
   </div>
   <div id="search-results" class="people-list"></div>
 </div>
 
-<!-- Nav -->
 <nav class="nav-bar">
-  <button class="nav-item active" onclick="switchTab('me',this)">
-    <div class="nav-indicator"></div>
-    <span class="nav-icon">👤</span>
-    <span class="nav-label">Профиль</span>
+  <button class="nav-item active" id="nav-btn-profile" onclick="switchTab('profile')">
+    <div class="nav-pill">👤</div>
+    <span>Профиль</span>
   </button>
-  <button class="nav-item" onclick="switchTab('search',this)">
-    <div class="nav-indicator"></div>
-    <span class="nav-icon">🔍</span>
-    <span class="nav-label">Поиск</span>
+  <button class="nav-item" id="nav-btn-search" onclick="switchTab('search')">
+    <div class="nav-pill">🔍</div>
+    <span>Поиск</span>
   </button>
 </nav>
 
 <script>
 const INITIAL_UID = {initial_uid};
+let currentTab = 'profile';
 let allProfiles = [];
-let myProfile = null;
+let profileHistory = []; // История просмотров для кнопки "Назад"
 
-// ── Tab switching ──────────────────────────────────────────────────────────
-function switchTab(name, btn) {{
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
-  document.getElementById('screen-' + name).classList.add('active');
-  btn.classList.add('active');
-  if (name === 'search') loadPeople();
-}}
-
-// ── Load my profile ────────────────────────────────────────────────────────
-async function loadMe() {{
-  document.getElementById('me-content').innerHTML = '<div class="loader"><div class="spinner"></div></div>';
-  const uid = INITIAL_UID || getTelegramUid();
-  if (!uid) {{
-    document.getElementById('me-content').innerHTML = renderEmpty('😕', 'Профиль не найден', 'Нажми /start в Telegram');
-    return;
-  }}
-  try {{
-    const r = await fetch('/api/profile/' + uid);
-    if (!r.ok) throw new Error();
-    myProfile = await r.json();
-    document.getElementById('me-content').innerHTML = renderProfile(myProfile);
-  }} catch {{
-    document.getElementById('me-content').innerHTML = renderEmpty('😕', 'Профиль не найден', 'Нажми /start боту в Telegram');
-  }}
-}}
-
+// Получение ID из Telegram WebApp
 function getTelegramUid() {{
   try {{
-    const tg = window.Telegram?.WebApp;
-    return tg?.initDataUnsafe?.user?.id || 0;
-  }} catch {{ return 0; }}
+    return window.Telegram?.WebApp?.initDataUnsafe?.user?.id || 0;
+  }} catch (e) {{ return 0; }}
 }}
 
-// ── Render profile ─────────────────────────────────────────────────────────
-function renderProfile(p) {{
-  const avatarHtml = p.avatar_url
-    ? `<img class="avatar" src="${{p.avatar_url}}" alt="">`
+// Инициализация при запуске
+window.addEventListener('DOMContentLoaded', () => {{
+  window.Telegram?.WebApp?.ready();
+  window.Telegram?.WebApp?.expand();
+  
+  // Добавляем обработку скролла для смены стиля TopBar
+  window.addEventListener('scroll', () => {{
+    const topBar = document.getElementById('main-top-bar');
+    if (window.scrollY > 10) {{
+      topBar.classList.add('scrolled');
+    }} else {{
+      topBar.classList.remove('scrolled');
+    }}
+  }});
+
+  // Загружаем изначальный профиль
+  const targetUid = INITIAL_UID || getTelegramUid();
+  if (targetUid) {{
+    loadProfile(targetUid, true);
+  }} else {{
+    showEmptyProfile();
+  }}
+}});
+
+// Переключение табов нижнего меню
+function switchTab(tabName) {{
+  if (currentTab === tabName && tabName === 'profile' && profileHistory.length <= 1) return;
+  
+  currentTab = tabName;
+  
+  // Обновление кнопок меню
+  document.querySelectorAll('.nav-item').forEach(btn => btn.classList.remove('active'));
+  document.getElementById('nav-btn-' + tabName).classList.add('active');
+  
+  // Переключение контейнеров
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('screen-' + tabName).classList.add('active');
+  
+  if (tabName === 'search') {{
+    profileHistory = []; // Сбрасываем стек истории при переходе на поиск
+    updateTopBar('Поиск', false, false);
+    loadAllProfiles();
+  }} else {{
+    const myUid = INITIAL_UID || getTelegramUid();
+    loadProfile(myUid, true);
+  }}
+}}
+
+// Обновление состояния Top App Bar
+function updateTopBar(title, showBack, showRefresh) {{
+  document.getElementById('top-bar-title').textContent = title;
+  document.getElementById('back-button').style.display = showBack ? 'flex' : 'none';
+  document.getElementById('refresh-button').style.display = showRefresh ? 'flex' : 'none';
+}}
+
+// Загрузка конкретного профиля по API
+async function loadProfile(uid, isRoot = false) {{
+  const container = document.getElementById('profile-content');
+  container.innerHTML = '<div class="loader"><div class="spinner"></div></div>';
+  
+  if (isRoot) {{
+    profileHistory = [uid];
+    updateTopBar('Мой профиль', false, true);
+  }} else {{
+    updateTopBar('Профиль', true, false);
+  }}
+
+  try {{
+    const response = await fetch('/api/profile/' + uid);
+    if (!response.ok) throw new Error();
+    const data = await response.json();
+    container.innerHTML = renderProfileHtml(data);
+  }} catch (err) {{
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">😕</div>
+        <div class="empty-text">Профиль не синхронизирован</div>
+        <div class="empty-sub">Введите команду /start в боте Telegram.</div>
+      </div>`;
+  }}
+}}
+
+// Обновление текущего профиля
+function handleRefresh() {{
+  if (profileHistory.length > 0) {{
+    loadProfile(profileHistory[profileHistory.length - 1], profileHistory.length === 1);
+  }}
+}}
+
+// Кнопка назад
+function goBack() {{
+  if (profileHistory.length > 1) {{
+    profileHistory.pop(); // Удаляем текущий
+    const prevUid = profileHistory[profileHistory.length - 1];
+    loadProfile(prevUid, profileHistory.length === 1);
+  }} else {{
+    switchTab('search');
+  }}
+}}
+
+// Открытие чужого профиля из поиска
+function openUserDetail(uid) {{
+  profileHistory.push(uid);
+  
+  // Переключаем визуал на вкладку профиля
+  currentTab = 'profile';
+  document.querySelectorAll('.nav-item').forEach(btn => btn.classList.remove('active'));
+  document.getElementById('nav-btn-profile').classList.add('active');
+  
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('screen-profile').classList.add('active');
+  
+  loadProfile(uid, false);
+}}
+
+// Рендеринг HTML карточки профиля
+function renderProfileHtml(p) {{
+  const avatar = p.avatar_url 
+    ? `<img class="avatar" src="${{p.avatar_url}}" alt="Avatar">`
     : `<div class="avatar-placeholder">${{p.full_name[0] || '?'}}</div>`;
+    
+  const premium = p.premium ? '<div class="premium-dot">⭐</div>' : '';
+  
+  // Обработка флагов/значков безопасности
+  let statusText = "Чистый";
+  let statusClass = "success";
+  if (p.scam || p.fake) {{ statusText = "🚨 Scam/Fake"; statusClass = "error"; }}
+  else if (p.restricted) {{ statusText = "⚠️ Ограничен"; statusClass = "error"; }}
 
-  const premiumBadge = p.premium ? '<div class="premium-badge">⭐</div>' : '';
-
-  const giftsHtml = p.gifts && p.gifts.length > 0
-    ? p.gifts.map((g, i) => `
-      <div class="gift-card" style="animation-delay:${{i*60}}ms">
+  // Подарки
+  let giftsHtml = '';
+  if (p.gifts && p.gifts.length > 0) {{
+    giftsHtml = p.gifts.map(g => `
+      <div class="gift-card">
         <div class="gift-header">
-          <span style="font-size:20px">🎀</span>
-          <span class="gift-name">${{g.id}}</span>
-          <span class="gift-stars">${{g.stars}} ⭐</span>
+          <span class="gift-title">🎀 Код: ${{g.id}}</span>
+          <span class="gift-badge">${{g.stars}} ⭐</span>
         </div>
         <div class="gift-body">
-          ${{g.text !== '—' ? `<div class="gift-row"><span class="gr-label">Подпись</span><span class="gr-val">${{g.text}}</span></div>` : ''}}
-          <div class="gift-row"><span class="gr-label">От</span><span class="gr-val">${{g.sender}} <span style="font-size:11px;opacity:.6">#${{g.sender_id}}</span></span></div>
-          <div class="gift-row"><span class="gr-label">Дата</span><span class="gr-val">${{g.date}}</span></div>
-          ${{g.private ? '<div class="gift-row"><span class="gr-label">Статус</span><span class="gift-private">🔒 Приватный</span></div>' : ''}}
+          ${{g.text !== '—' ? `<div class="gift-row"><span class="prop">Сообщение</span><span class="val">${{g.text}}</span></div>` : ''}}
+          <div class="gift-row"><span class="prop">Отправитель</span><span class="val">${{g.sender}} (ID: ${{g.sender_id}})</span></div>
+          <div class="gift-row"><span class="prop">Дата получения</span><span class="val">${{g.date}}</span></div>
+          ${{g.private ? `<div class="gift-row"><span class="prop">Приватность</span><span class="val" style="color:var(--md-co-error)">🔒 Личный подарок</span></div>` : ''}}
         </div>
-      </div>`).join('')
-    : `<div style="margin:0 16px 16px"><div class="empty"><div class="empty-icon">🎁</div><div class="empty-text">Нет подарков</div><div class="empty-sub">или они скрыты</div></div></div>`;
-
-  const badges = [
-    ['Premium',    p.premium,    '⭐ Да', '❌ Нет'],
-    ['Верифицирован', p.verified, '✅ Да', '❌ Нет'],
-    ['Ограничен',  p.restricted, '⚠️ Да', '✅ Нет'],
-    ['Scam / Fake', p.scam || p.fake, '🚨 Да', '✅ Нет'],
-    ['Язык',       null, p.language, p.language],
-    ['Регистрация', null, p.reg_date, p.reg_date],
-  ];
-
-  const cardsHtml = badges.map(([label, flag, yes, no], i) => {{
-    const val = flag === null ? yes : (flag ? yes : no);
-    const cls = flag === null ? '' : (flag ? (label === 'Premium' || label === 'Верифицирован' ? 'yes' : 'warn') : (label === 'Ограничен' || label.includes('Scam') ? 'yes' : 'no'));
-    return `<div class="info-card" style="animation-delay:${{(i+1)*60}}ms">
-      <div class="label">${{label}}</div>
-      <div class="value ${{cls}}">${{val}}</div>
-    </div>`;
-  }}).join('');
+      </div>
+    `).join('');
+  }} else {{
+    giftsHtml = `
+      <div class="empty-state">
+        <div class="empty-icon">🎁</div>
+        <div class="empty-text">Нет активных подарков</div>
+      </div>`;
+  }}
 
   return `
     <div class="profile-hero">
-      <div class="avatar-wrap">
-        ${{avatarHtml}}
-        ${{premiumBadge}}
+      <div class="avatar-container">
+        ${{avatar}}
+        ${{premium}}
       </div>
-      <div class="hero-info">
-        <div class="hero-name">${{p.full_name}}</div>
-        ${{p.username ? `<div class="hero-username">@${{p.username}}</div>` : ''}}
+      <div class="hero-details">
+        <div class="hero-title">${{p.full_name}}</div>
+        ${{p.username ? `<div class="hero-subtitle">@${{p.username}}</div>` : ''}}
         <div class="hero-id">ID: ${{p.id}}</div>
       </div>
     </div>
-    <div class="cards-grid">${{cardsHtml}}</div>
-    <div class="section-title">Подарки (${{p.gifts?.length || 0}})</div>
+
+    <div class="info-grid">
+      <div class="info-card">
+        <span class="label">Премиум</span>
+        <span class="value ${{p.premium ? 'success' : ''}}">${{p.premium ? 'Активен' : 'Нет'}}</span>
+      </div>
+      <div class="info-card">
+        <span class="label">Статус защиты</span>
+        <span class="value ${{statusClass}}">${{statusText}}</span>
+      </div>
+      <div class="info-card">
+        <span class="label">Язык интерфейса</span>
+        <span class="value">${{p.language.toUpperCase()}}</span>
+      </div>
+      <div class="info-card">
+        <span class="label">Верификация</span>
+        <span class="value ${{p.verified ? 'success' : ''}}">${{p.verified ? 'Да' : 'Нет'}}</span>
+      </div>
+    </div>
+
+    <div class="section-title">Коллекция подарков (${{p.gifts?.length || 0}})</div>
     ${{giftsHtml}}
   `;
 }}
 
-// ── People / Search ────────────────────────────────────────────────────────
-async function loadPeople() {{
-  if (allProfiles.length > 0) {{ renderPeople(allProfiles); return; }}
-  document.getElementById('search-results').innerHTML = '<div class="loader"><div class="spinner"></div></div>';
+// Загрузка всех пользователей (для поиска)
+async function loadAllProfiles() {{
+  const resContainer = document.getElementById('search-results');
+  resContainer.innerHTML = '<div class="loader"><div class="spinner"></div></div>';
   try {{
-    const r = await fetch('/api/profiles');
-    allProfiles = await r.json();
-    renderPeople(allProfiles);
-  }} catch {{
-    document.getElementById('search-results').innerHTML = renderEmpty('😕', 'Ошибка загрузки', '');
+    const response = await fetch('/api/profiles');
+    allProfiles = await response.json();
+    renderPeopleList(allProfiles);
+  }} catch(e) {{
+    resContainer.innerHTML = '<div class="empty-state"><div class="empty-text">Ошибка загрузки списка</div></div>';
   }}
 }}
 
-function filterPeople() {{
-  const q = document.getElementById('search-input').value.toLowerCase().trim();
-  const filtered = q
-    ? allProfiles.filter(p =>
-        p.full_name.toLowerCase().includes(q) ||
-        (p.username || '').toLowerCase().includes(q) ||
-        String(p.id).includes(q)
-      )
-    : allProfiles;
-  renderPeople(filtered);
-}}
-
-function renderPeople(list) {{
-  const el = document.getElementById('search-results');
-  if (!list.length) {{
-    el.innerHTML = renderEmpty('🔍', 'Никого не найдено', 'Попробуй другой запрос');
+// Поиск / Фильтрация списка
+function onSearchInput() {{
+  const query = document.getElementById('search-input').value.toLowerCase().trim();
+  if(!query) {{
+    renderPeopleList(allProfiles);
     return;
   }}
-  el.innerHTML = list.map((p, i) => {{
-    const avatarHtml = p.avatar_url
-      ? `<img class="person-avatar" src="${{p.avatar_url}}" style="object-fit:cover" alt="">`
-      : `<div class="person-avatar">${{p.full_name[0] || '?'}}</div>`;
-    const giftCount = p.gifts?.length || 0;
-    return `<div class="person-card" style="animation-delay:${{i*40}}ms" onclick="openPerson(${{p.id}})">
-      ${{avatarHtml}}
-      <div class="person-info">
-        <div class="person-name">${{p.full_name}}</div>
-        <div class="person-sub">${{p.username ? '@' + p.username + ' · ' : ''}}ID: ${{p.id}}</div>
+  const filtered = allProfiles.filter(p => 
+    p.full_name.toLowerCase().includes(query) || 
+    (p.username || '').toLowerCase().includes(query) || 
+    String(p.id).includes(query)
+  );
+  renderPeopleList(filtered);
+}}
+
+// Отображение списка пользователей
+function renderPeopleList(list) {{
+  const resContainer = document.getElementById('search-results');
+  if(!list.length) {{
+    resContainer.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">🔍</div>
+        <div class="empty-text">Никого не найдено</div>
+      </div>`;
+    return;
+  }}
+  
+  resContainer.innerHTML = list.map(p => {{
+    const avatar = p.avatar_url 
+      ? `<img class="person-avatar" src="${{p.avatar_url}}" alt="">`
+      : `<div class="person-avatar-placeholder">${{p.full_name[0] || '?'}}</div>`;
+    const giftsCount = p.gifts?.length || 0;
+    
+    return `
+      <div class="person-item" onclick="openUserDetail(${{p.id}})">
+        ${{avatar}}
+        <div class="person-info">
+          <div class="person-name">${{p.full_name}}</div>
+          <div class="person-sub">${{p.username ? '@'+p.username : 'ID: ' + p.id}}</div>
+        </div>
+        ${{giftsCount > 0 ? `<div class="person-badge">🎁 ${{giftsCount}}</div>` : ''}}
       </div>
-      ${{giftCount > 0 ? `<span class="person-chip">🎁 ${{giftCount}}</span>` : ''}}
-    </div>`;
+    `;
   }}).join('');
 }}
 
-function openPerson(uid) {{
-  // Переключаемся на вкладку профиля и загружаем чужой профиль
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
-  document.getElementById('screen-me').classList.add('active');
-  document.querySelector('.nav-item').classList.add('active');
-  document.querySelector('.top-bar h1').textContent = 'Профиль';
-  
-  document.getElementById('me-content').innerHTML = '<div class="loader"><div class="spinner"></div></div>';
-  fetch('/api/profile/' + uid)
-    .then(r => r.json())
-    .then(p => {{ document.getElementById('me-content').innerHTML = renderProfile(p); }})
-    .catch(() => {{ document.getElementById('me-content').innerHTML = renderEmpty('😕', 'Не найдено', ''); }});
+function showEmptyProfile() {{
+  document.getElementById('profile-content').innerHTML = `
+    <div class="empty-state">
+      <div class="empty-icon">👤</div>
+      <div class="empty-text">Не удалось определить профиль</div>
+    </div>`;
 }}
-
-function renderEmpty(icon, text, sub) {{
-  return `<div class="empty"><div class="empty-icon">${{icon}}</div><div class="empty-text">${{text}}</div><div class="empty-sub">${{sub}}</div></div>`;
-}}
-
-// ── Init ───────────────────────────────────────────────────────────────────
-window.Telegram?.WebApp?.ready();
-window.Telegram?.WebApp?.expand();
-loadMe();
 </script>
 </body>
 </html>"""
