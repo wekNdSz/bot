@@ -1,0 +1,6 @@
+aiogram==3.28.2
+aiohttp
+aiofiles
+fastapi
+uvicorn
+jinja2
